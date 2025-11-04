@@ -1,0 +1,28 @@
+# --- Diretórios e ficheiros temporários ---
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tmp
+*.swp
+*.swo
+
+# --- Ambientes virtuais ---
+venv/
+.env/
+
+# --- Resultados gerados automaticamente ---
+out/*
+!out/.gitkeep
+
+# --- Dados sensíveis ---
+*.key
+*.pem
+*.ovpn
+*.crt
+
+# --- Ficheiros do sistema e editores ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

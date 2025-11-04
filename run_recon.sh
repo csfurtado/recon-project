@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# run_recon.sh — Orquestrador com interface CLI, menu interactivo e suporte a --help
+# run_recon.sh — Orquestrador Recon Pipeline (com resolução automática de domínios)
 set -euo pipefail
+# Determine owner (if run with sudo, use original user)
+if [ -n "${SUDO_USER-}" ]; then
+  OWNER="$SUDO_USER"
+else
+  OWNER="$USER"
+fi
 
 # Defaults
 OUTDIR="out"
@@ -9,9 +15,12 @@ NMAP_OUTDIR="$OUTDIR/nmap"
 HARV_OUTDIR="$OUTDIR/harvester"
 MASSCAN_RATE=500
 MAX_NMAP_WORKERS=6
-NMAP_EXTRA_ARGS="-sC -sV -O -p-"
+# NOTE: remove -p- from NMAP_EXTRA_ARGS so we only pass -p once (either -p <ports> or -p-)
+NMAP_EXTRA_ARGS="-sC -sV -O"
 
-# Usage/help text (used by -h and --help)
+# -----------------------
+# Função de ajuda
+# -----------------------
 usage() {
   cat <<'EOF'
 run_recon.sh — Orquestrador Recon Pipeline
@@ -49,17 +58,57 @@ EOF
 # -----------------------
 # Helpers
 # -----------------------
-ensure_dirs() { mkdir -p "$OUTDIR" "$NMAP_OUTDIR" "$HARV_OUTDIR"; }
+
+ensure_dirs() {
+  mkdir -p "$OUTDIR" "$NMAP_OUTDIR" "$HARV_OUTDIR"
+  # ensure correct ownership so that later sudo-created files won't block user
+  sudo chown -R "$OWNER":"$OWNER" "$OUTDIR" || true
+}
+
+chown_out() {
+  # Called after any sudo command that may create root-owned files
+  if command -v sudo >/dev/null 2>&1; then
+    sudo chown -R "$OWNER":"$OWNER" "$OUTDIR" || true
+  fi
+}
+
+resolve_domains_to_ips() {
+  local domains="$1"
+  local ips=""
+  mkdir -p "$OUTDIR"
+  local mapfile="$OUTDIR/domain_ip_map.txt"
+  echo "" > "$mapfile"
+  for d in $domains; do
+    echo "[*] A resolver domínio: $d" >&2
+    ip=$(dig +short "$d" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+    if [ -n "$ip" ]; then
+      echo "    -> $d resolve para $ip" >&2
+      echo "$d -> $ip" >> "$mapfile"
+      ips="$ips $ip"
+    else
+      echo "    [!] Não foi possível resolver $d" >&2
+    fi
+  done
+  # trim leading whitespace
+  echo "$ips" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
 
 run_masscan_from_file() {
   local file="$1"
   echo "[*] masscan (file) -> $file"
   sudo masscan -iL "$file" -p1-65535 --rate "$MASSCAN_RATE" -oJ "$MASSCAN_JSON"
+  chown_out
 }
 run_masscan_from_targets() {
   local tgt="$1"
+  # if empty, don't call masscan
+  if [ -z "${tgt// /}" ]; then
+    echo "[!] run_masscan_from_targets called with empty targets; skipping masscan."
+    return 1
+  fi
   echo "[*] masscan (targets) -> $tgt"
   sudo masscan $tgt -p1-65535 --rate "$MASSCAN_RATE" -oJ "$MASSCAN_JSON"
+  chown_out
 }
 
 build_hosts_ports() {
@@ -79,10 +128,12 @@ byip=defaultdict(list)
 for e in data:
     ip=e.get("ip")
     for p in e.get("ports",[]):
-        byip[ip].append(str(p.get("port")))
+        byip[ip].append(int(p.get("port")))
 with open("out/hosts_ports.txt","w") as f:
     for ip,ports in byip.items():
-        f.write(f"{ip} {','.join(sorted(set(ports)))}\n")
+        ports_sorted = sorted(set(ports))
+        # write ports as comma-separated (nmap expects comma-separated)
+        f.write(f"{ip} {','.join(str(p) for p in ports_sorted)}\n")
 print("[*] hosts_ports.txt gerado com",len(byip),"hosts")
 PY
 }
@@ -94,12 +145,23 @@ run_nmap_per_host() {
       ip="$1"
       ports="$2"
       outfile="$NMAP_OUTDIR/${ip}.xml"
-      echo "[nmap] $ip -> $ports"
-      sudo nmap $NMAP_EXTRA_ARGS -p "$ports" -oX "$outfile" "$ip" || echo "[!] nmap erro em $ip"
+
+      # normalize ports: replace spaces/newlines with commas and remove trailing commas
+      ports_clean=$(echo "$ports" | tr ' ' ',' | tr '\n' ',' | sed 's/,,*/,/g' | sed 's/^,//; s/,$//')
+
+      # if ports_clean is empty, fallback to scanning all ports
+      if [ -z "$ports_clean" ]; then
+        echo "[nmap] $ip -> (no ports listed) using -p- (full port scan)"
+        sudo nmap $NMAP_EXTRA_ARGS -p- -oX "$outfile" "$ip" || echo "[!] nmap erro em $ip"
+      else
+        echo "[nmap] $ip -> $ports_clean"
+        sudo nmap $NMAP_EXTRA_ARGS -p "$ports_clean" -oX "$outfile" "$ip" || echo "[!] nmap erro em $ip"
+      fi
     }
     export -f run_nmap
     export NMAP_EXTRA_ARGS
     export NMAP_OUTDIR
+    # read pairs ip ports from hosts_ports.txt and run in parallel
     cat out/hosts_ports.txt | xargs -n2 -P "$MAX_NMAP_WORKERS" bash -c 'run_nmap "$0" "$1"'
     return 0
   else
@@ -113,6 +175,7 @@ run_nmap_direct_targets() {
   for t in $targets; do
     [ -z "$t" ] && continue
     outbase=$(echo "$t" | tr '/:' '_' )
+    # full port scan for direct targets
     sudo nmap $NMAP_EXTRA_ARGS -p- -oX "$NMAP_OUTDIR/${outbase}.xml" "$t" || echo "[!] nmap erro $t"
   done
 }
@@ -128,16 +191,18 @@ run_harvester_for_domains() {
   done
 }
 
-compile_aggregate() {
-  if [ ! -x tools/aggregate ]; then
-    echo "[*] compilando tools/aggregate"
-    (cd tools && go build -o aggregate aggregate.go)
+run_aggregate() {
+  if [ -f tools/aggregate.py ]; then
+    echo "[*] Running Python aggregator (tools/aggregate.py)"
+    python3 tools/aggregate.py --masscan "$MASSCAN_JSON" --nmapdir "$NMAP_OUTDIR" --outdir "$OUTDIR"
+    return $?
   fi
+  echo "[!] tools/aggregate.py not found; skipping aggregation."
+  return 1
 }
-run_aggregate() { compile_aggregate; tools/aggregate -masscan "$MASSCAN_JSON" -nmapdir "$NMAP_OUTDIR" -outdir "$OUTDIR"; }
 
 # -----------------------
-# Parse both short and long options using getopt
+# Parse arguments
 # -----------------------
 if ! PARSED=$(getopt -o t:T:d:D:r:w:h --long targets:,targets-file:,domains:,domains-file:,rate:,workers:,help -- "$@"); then
   usage
@@ -157,7 +222,7 @@ while true; do
     -D|--domains-file) DOMAINS_FILE="$2"; shift 2 ;;
     -r|--rate) MASSCAN_RATE="$2"; shift 2 ;;
     -w|--workers) MAX_NMAP_WORKERS="$2"; shift 2 ;;
-    -h|--help) usage; shift ;;
+    -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     *) break ;;
   esac
@@ -167,7 +232,6 @@ done
 if [ -n "$TARGETS_CLI" ]; then
   TARGETS="$TARGETS_CLI"
 elif [ -n "$TARGETS_FILE" ]; then
-  if [ ! -f "$TARGETS_FILE" ]; then echo "Ficheiro targets não encontrado: $TARGETS_FILE"; exit 1; fi
   TARGETS="$(tr '\n' ' ' < "$TARGETS_FILE" | sed 's/[[:space:]]\+/ /g')"
 elif [ -f "targets.txt" ]; then
   TARGETS="$(tr '\n' ' ' < targets.txt | sed 's/[[:space:]]\+/ /g')"
@@ -178,7 +242,6 @@ fi
 if [ -n "$DOMAINS_CLI" ]; then
   DOMAINS="$DOMAINS_CLI"
 elif [ -n "$DOMAINS_FILE" ]; then
-  if [ ! -f "$DOMAINS_FILE" ]; then echo "Ficheiro domains não encontrado: $DOMAINS_FILE"; exit 1; fi
   DOMAINS="$(tr '\n' ' ' < "$DOMAINS_FILE" | sed 's/[[:space:]]\+/ /g')"
 elif [ -f "domains.txt" ]; then
   DOMAINS="$(tr '\n' ' ' < domains.txt | sed 's/[[:space:]]\+/ /g')"
@@ -186,7 +249,32 @@ else
   DOMAINS=""
 fi
 
-# If CLI provided targets/domains, run without menu
+# Resolver domínios se não houver targets
+if [ -z "$TARGETS" ] && [ -n "$DOMAINS" ]; then
+  echo "[*] Nenhum target fornecido, mas domínios disponíveis. A resolver..."
+  TARGETS=$(resolve_domains_to_ips "$DOMAINS")
+  echo "[*] IPs resolvidos a partir de domínios: $TARGETS"
+fi
+
+# -----------------------
+# Gerar report automaticamente (se existir o report_generator)
+# -----------------------
+generate_report_if_possible() {
+  # prefer owner variable se existir (definida no topo do script)
+  REPORT_AUTHOR="${OWNER:-${SUDO_USER:-${USER:-unknown}}}"
+  if [ -f tools/report_generator.py ]; then
+    echo "[*] Gerando relatório automático com tools/report_generator.py..."
+    python3 tools/report_generator.py --outdir "$OUTDIR" --repo "Recon Automation" --author "$REPORT_AUTHOR" || echo "[!] Falha ao gerar report (tools/report_generator.py)"
+    echo "[*] report.md gerado em $OUTDIR/report.md"
+  else
+    echo "[*] tools/report_generator.py não encontrado — a saltar geração de relatório."
+  fi
+}
+
+# -----------------------
+# CLI (sem menu)
+# -----------------------
+
 if [ -n "$TARGETS" ] || [ -n "$DOMAINS" ]; then
   ensure_dirs
   echo "[*] Targets: $TARGETS"
@@ -194,31 +282,49 @@ if [ -n "$TARGETS" ] || [ -n "$DOMAINS" ]; then
   echo "[*] Masscan rate: $MASSCAN_RATE"
   echo "[*] Max nmap workers: $MAX_NMAP_WORKERS"
 
-  if [ -n "$TARGETS_FILE" ] || [ -f "targets.txt" ]; then
-    if [ -n "$TARGETS_FILE" ]; then run_masscan_from_file "$TARGETS_FILE"
-    else run_masscan_from_file "targets.txt"; fi
-  else
-    run_masscan_from_targets "$TARGETS"
-  fi
-
+  run_masscan_from_targets "$TARGETS" || true
   build_hosts_ports
 
   if run_nmap_per_host; then
     echo "[*] Nmap per-host concluído"
   else
-    echo "[*] A usar Nmap direto aos targets"
-    if [ -n "$TARGETS" ]; then run_nmap_direct_targets "$TARGETS"; fi
+    run_nmap_direct_targets "$TARGETS"
   fi
 
   if [ -n "$DOMAINS" ]; then run_harvester_for_domains "$DOMAINS"; fi
+
+  # backup previous inventory if exists
+  if [ -f "$OUTDIR/inventory.json" ]; then
+    ts=$(date +%F_%H%M%S)
+    cp "$OUTDIR/inventory.json" "$OUTDIR/inventory.json.$ts.bak"
+    echo "[*] Backed up previous inventory to $OUTDIR/inventory.json.$ts.bak"
+  fi
 
   run_aggregate
   echo "[*] Pipeline concluída. Outputs em $OUTDIR"
   exit 0
 fi
 
+# ==========================
+# Geração automática do relatório
+# ==========================
+
+echo "[*] Limpando relatórios antigos..."
+rm -f out/report.md out/report.pdf
+
+echo "[*] Gerando relatório automático..."
+python3 tools/report_generator.py --outdir out --repo "Recon Automation" --author "Claudia"
+
+if [ -f out/report.pdf ]; then
+    echo "[+] Relatório criado com sucesso: out/report.pdf"
+    # Abrir PDF automaticamente (Linux desktop)
+    xdg-open out/report.pdf >/dev/null 2>&1 &
+else
+    echo "[!] Falha ao gerar relatório."
+fi
+
 # -----------------------
-# Interactive menu (no CLI args)
+# Menu interativo
 # -----------------------
 ensure_dirs
 while true; do
@@ -227,15 +333,13 @@ while true; do
 ===========================================
  Recon Pipeline — Menu Interactivo
 ===========================================
-Escolhe uma opção (tecla e Enter):
-
   1) Run FULL pipeline (Masscan -> Nmap -> theHarvester -> Aggregate)
   2) Run Masscan only
-  3) Run Nmap only (confirm from masscan results or enter targets)
-  4) Run theHarvester only (enter domains)
-  5) Aggregate only (parse existing out/)
-  6) Show last outputs (ls -R out/)
-  7) Help (show usage)
+  3) Run Nmap only
+  4) Run theHarvester only
+  5) Aggregate only
+  6) Show outputs
+  7) Help
   0) Exit
 ===========================================
 MENU
@@ -243,53 +347,37 @@ MENU
   read -rp "Opção: " opt
   case "$opt" in
     1)
-      read -rp "Targets (space-separated) or press Enter to use targets.txt: " t_in
-      read -rp "Domains (space-separated) or press Enter to use domains.txt: " d_in
+      read -rp "Targets (IPs) ou Enter: " t_in
+      read -rp "Domínios (space-separated) ou Enter: " d_in
+      [ -z "$t_in" ] && [ -n "$d_in" ] && t_in=$(resolve_domains_to_ips "$d_in")
       read -rp "Masscan rate (default $MASSCAN_RATE): " rate_in
-      read -rp "Max Nmap workers (default $MAX_NMAP_WORKERS): " w_in
       [ -n "$rate_in" ] && MASSCAN_RATE="$rate_in"
-      [ -n "$w_in" ] && MAX_NMAP_WORKERS="$w_in"
-      if [ -n "$t_in" ]; then
-        run_masscan_from_targets "$t_in"
-      else
-        if [ -f targets.txt ]; then run_masscan_from_file "targets.txt"; else echo "[!] Nenhum target fornecido e targets.txt não existe. Abortando step 1."; continue; fi
-      fi
+
+      run_masscan_from_targets "$t_in" || true
       build_hosts_ports
-      if ! run_nmap_per_host; then
-        if [ -n "$t_in" ]; then run_nmap_direct_targets "$t_in"; else echo "[!] Nmap não executado por falta de alvos."; fi
-      fi
-      if [ -n "$d_in" ]; then run_harvester_for_domains "$d_in"
-      else if [ -f domains.txt ]; then run_harvester_for_domains "$(tr '\n' ' ' < domains.txt)"; fi
-      fi
+      run_nmap_per_host || run_nmap_direct_targets "$t_in"
+      [ -n "$d_in" ] && run_harvester_for_domains "$d_in"
       run_aggregate
+      generate_report_if_possible
       ;;
     2)
-      read -rp "Targets (space-separated) or press Enter to use targets.txt: " t_in
-      read -rp "Masscan rate (default $MASSCAN_RATE): " rate_in
-      [ -n "$rate_in" ] && MASSCAN_RATE="$rate_in"
-      if [ -n "$t_in" ]; then run_masscan_from_targets "$t_in"
-      else if [ -f targets.txt ]; then run_masscan_from_file "targets.txt"; else echo "[!] Nenhum target fornecido e targets.txt não existe."; fi
-      fi
+      read -rp "Targets ou Enter: " t_in
+      run_masscan_from_targets "$t_in"
       build_hosts_ports
       ;;
     3)
-      echo "[*] Nmap confirm/scan"
-      if [ -f out/hosts_ports.txt ] && [ -s out/hosts_ports.txt ]; then run_nmap_per_host
-      else read -rp "Nenhum resultado masscan — introduz targets (space-separated): " t_in; if [ -n "$t_in" ]; then run_nmap_direct_targets "$t_in"; else echo "[!] Nenhum alvo fornecido."; fi
-      fi
+      read -rp "Targets ou Enter: " t_in
+      run_nmap_direct_targets "$t_in"
       ;;
     4)
-      read -rp "Introduz domínios (space-separated) or press Enter to use domains.txt: " d_in
-      if [ -n "$d_in" ]; then run_harvester_for_domains "$d_in"
-      else if [ -f domains.txt ]; then run_harvester_for_domains "$(tr '\n' ' ' < domains.txt)"; else echo "[!] Nenhum domínio fornecido e domains.txt não existe."; fi
-      fi
+      read -rp "Domínios ou Enter: " d_in
+      run_harvester_for_domains "$d_in"
       ;;
     5)
-      echo "[*] Executando aggregator (parse outputs existentes)"
       run_aggregate
+      generate_report_if_possible
       ;;
     6)
-      echo "[*] Conteúdo de out/:"
       ls -R out || true
       ;;
     7)
@@ -303,7 +391,5 @@ MENU
       echo "Opção inválida."
       ;;
   esac
-
-  echo -e "\nPressiona Enter para voltar ao menu..."
-  read -r _
+  read -rp "Enter para continuar..."
 done
